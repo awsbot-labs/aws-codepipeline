@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  AWSBot CloudFormation Template Continuous Delivery: This template
+  builds an AWS CodePipeline pipeline that implements a continuous delivery release
+  process for AWS CloudFormation stacks.
+  **WARNING** This template creates an Amazon EC2 instance. You will be billed
+  for the AWS resources used when you create a stack using this template.
+
+Parameters:
+  Environment:
+    Description: Environment to deploy to
+    Type: String
+    AllowedValues:
+      - dev
+      - test
+      - prod
+  RepositoryName:
+    Description: Name of the CodeCommit repository
+    Type: String
+  StackName:
+    Description: Name of the CloudFormation Stack to update/create
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "General Settings"
+        Parameters:
+          - Environment
+      - Label:
+          default: "CodeBuild Settings"
+        Parameters:
+          - RepositoryName
+
+Conditions:
+  CreateDevResources: !Equals [dev, !Ref Environment]
+  CreateS3Pipeline: !Not
+    - !Equals [dev, !Ref Environment]
+
+Resources:
+  CodePipelineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+
+  CodePipelineBuildRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+
+
+  CodePipelineCFNRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: CreateDevResources
+    Properties:
+      ArtifactStore:
+        Location: !FindInMap [ EnvironmentMap, !Ref Environment, ArtifactStoreBucket ]
+        Type: S3
+      DisableInboundStageTransitions: []
+      Name: !Join
+        - '-'
+        - - !Ref RepositoryName
+          - !Ref Environment
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Join
+                  - '-'
+                  - - !Ref RepositoryName
+                    - !Ref Environment
+                BranchName: master
+              OutputArtifacts:
+                - Name: Source
+              RunOrder: '1'
+        - Name: CloudFormation
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider:  CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: Source
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_NAMED_IAM
+                ParameterOverrides: !Join
+                    - ''
+                    - - '{ "Environment": "'
+                      - !Ref Environment
+                      - '" }'
+                RoleArn: !GetAtt CodePipelineCFNRole.Arn
+                StackName: !Ref StackName
+                TemplatePath: Source::cloudformation.yml
+                TemplateConfiguration: !Join
+                  - ''
+                  - - 'Source::configuration/'
+                    - !Ref Environment
+                    - '.json'
+              RunOrder: '1'
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Join
+                  - '-'
+                  - - !Ref RepositoryName
+                    - !Ref Environment
+              InputArtifacts:
+                - Name: Source
+              OutputArtifacts:
+                - Name: Build
+              RunOrder: '1'
+        - Name: Test
+          Actions:
+            - Name: Invoke
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: PipelineDeploy
+                UserParameters:  !Join
+                  - ''
+                  - - '{"Buckets": ["'
+                    - !FindInMap [ EnvironmentMap, !Ref Environment, DeployBuckets ]
+                    - '"], "Key": "'
+                    - !Ref RepositoryName
+                    - '/deploy.zip"}'
+              RunOrder: '1'
+              InputArtifacts:
+                - Name: Build
+
+  S3Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: CreateS3Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !FindInMap [ EnvironmentMap, !Ref Environment, ArtifactStoreBucket ]
+        Type: S3
+      DisableInboundStageTransitions: []
+      Name: !Join
+        - '-'
+        - - !Ref RepositoryName
+          - !Ref Environment
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !FindInMap [ EnvironmentMap, !Ref Environment, ArtifactStoreBucket ]
+                S3ObjectKey: !Join
+                  - ''
+                  - - !Ref RepositoryName
+                    - /deploy.zip
+              OutputArtifacts:
+                - Name: Source
+              RunOrder: '1'
+        - Name: CloudFormation
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider:  CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: Source
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                Capabilities: CAPABILITY_IAM
+                ParameterOverrides: !Join
+                    - ''
+                    - - '{ "Environment": "'
+                      - !Ref Environment
+                      - '" }'
+                RoleArn: !GetAtt CodePipelineCFNRole.Arn
+                StackName: !Ref StackName
+                TemplatePath: Source::cloudformation.yml
+                TemplateConfiguration: !Join
+                  - ''
+                  - - 'Source::configuration/'
+                    - !Ref Environment
+                    - '.json'
+              RunOrder: '1'
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Join
+                  - '-'
+                  - - !Ref RepositoryName
+                    - !Ref Environment
+              InputArtifacts:
+                - Name: Source
+              OutputArtifacts:
+                - Name: Build
+              RunOrder: '1'
+
+  CodeBuild:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: !Join
+        - '-'
+        - - !Ref RepositoryName
+          - !Ref Environment
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/ubuntu-base:14.04
+      ServiceRole: !Ref CodePipelineBuildRole
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: '5'
+
+  CodeCommitRepository:
+    Condition: CreateDevResources
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Join
+        - '-'
+        - - !Ref RepositoryName
+          - !Ref Environment

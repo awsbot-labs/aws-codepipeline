@@ -1,0 +1,18 @@
+version: 0.2
+phases:
+  install:
+    commands:
+      - echo Install started on `date`
+      - apt-get update -y
+  pre_build:
+    commands:
+      - echo Prebuild started on `date`
+  build:
+    commands:
+      - echo Build started on `date`
+  post_build:
+    commands:
+      - echo Post-build started on `date`
+artifacts:
+  files:
+    - '**/*'
